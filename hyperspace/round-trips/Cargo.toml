@@ -1,0 +1,15 @@
+# Round trips and wall time: stock SQLx 0.9.0 against this fork. See HYPERSPACE.md.
+[package]
+name = "sqlx-round-trips"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# not a member of the SQLx workspace
+[workspace]
+
+[dependencies]
+stock = { package = "sqlx", version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
+fork = { package = "sqlx", path = "../..", default-features = false, features = ["postgres", "runtime-tokio"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
