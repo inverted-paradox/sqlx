@@ -211,6 +211,22 @@ impl PgConnection {
         }
     }
 
+    /// Whether a parameter or column is of a type this connection has not resolved yet.
+    pub(crate) fn has_unknown_types(
+        &self,
+        param_desc: Option<&ParameterDescription>,
+        row_desc: Option<&RowDescription>,
+    ) -> bool {
+        let params = param_desc.into_iter().flat_map(|desc| desc.types.iter());
+        let columns = row_desc
+            .into_iter()
+            .flat_map(|desc| desc.fields.iter().map(|field| &field.data_type_id));
+
+        params
+            .chain(columns)
+            .any(|oid| self.try_oid_to_type(*oid).is_none())
+    }
+
     fn try_oid_to_type(&self, oid: Oid) -> Option<PgTypeInfo> {
         PgTypeInfo::try_from_oid(oid).or_else(|| self.inner.cache_type_info.get(&oid).cloned())
     }

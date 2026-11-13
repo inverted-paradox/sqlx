@@ -226,6 +226,14 @@ impl WriteBuffer {
         self.bytes_flushed >= self.bytes_written
     }
 
+    /// Discards what was written after the first `len` unflushed bytes, such as the start of
+    /// a pipeline whose later message failed to encode.
+    pub fn truncate_unflushed(&mut self, len: usize) {
+        self.bytes_written = cmp::min(self.bytes_written, self.bytes_flushed + len);
+        self.buf.truncate(self.bytes_written);
+        self.sanity_check();
+    }
+
     pub fn is_full(&self) -> bool {
         self.bytes_written == self.buf.len()
     }

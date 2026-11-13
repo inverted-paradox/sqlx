@@ -145,6 +145,8 @@ impl PgConnection {
                 pending_ready_for_query_count: 0,
                 next_statement_id: StatementId::NAMED_START,
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
+                unconfirmed_statement: None,
+                statements_to_close: Vec::new(),
                 cache_type_oid: HashMap::new(),
                 cache_type_info: HashMap::new(),
                 cache_elem_type_to_array: HashMap::new(),

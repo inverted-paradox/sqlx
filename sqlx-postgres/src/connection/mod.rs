@@ -62,6 +62,13 @@ pub struct PgConnectionInner {
     // cache statement by query string to the id and columns
     cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
 
+    // a named statement sent in a pipeline that is not cached yet: if its query is dropped
+    // before it is described, nothing else would close it
+    unconfirmed_statement: Option<StatementId>,
+
+    // named statements to close with the next query (evicted from the cache, or never cached)
+    statements_to_close: Vec<StatementId>,
+
     // cache user-defined types by id <-> info
     cache_type_info: HashMap<Oid, PgTypeInfo>,
     cache_type_oid: HashMap<UStr, Oid>,
@@ -214,7 +221,15 @@ impl Connection for PgConnection {
 
         self.wait_until_ready().await?;
 
+        self.queue_unconfirmed_close();
+
+        let mut ids = std::mem::take(&mut self.inner.statements_to_close);
+
         while let Some((id, _)) = self.inner.cache_statement.remove_lru() {
+            ids.push(id);
+        }
+
+        for id in ids {
             self.inner.stream.write_msg(Close::Statement(id))?;
             cleared += 1;
         }

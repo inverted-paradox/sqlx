@@ -25,10 +25,10 @@ async fn prepare(
     sql: &str,
     arg_types: &[PgTypeInfo],
     metadata: Option<Arc<PgStatementMetadata>>,
-    persistent: bool,
+    named: bool,
     resolve_column_origin: bool,
 ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-    let id = if persistent {
+    let id = if named {
         let id = conn.inner.next_statement_id;
         conn.inner.next_statement_id = id.next();
         id
@@ -60,6 +60,7 @@ async fn prepare(
 
     // we ask for the server to immediately send us the result of the PARSE command
     conn.write_sync();
+    conn.write_statements_to_close();
     conn.inner.stream.flush().await?;
 
     // indicates that the SQL query string is now successfully parsed and has semantic validity
@@ -118,6 +119,15 @@ async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription
     Ok(rows)
 }
 
+/// A statement parsed in the same round trip that executes it, until it is described.
+struct Pipelined {
+    /// The statement to cache once it is known to exist; never cached if unnamed.
+    id: StatementId,
+    /// `Describe` was sent and its reply has not been read yet.
+    describing: bool,
+    parameters: Option<ParameterDescription>,
+}
+
 impl PgConnection {
     // wait for CloseComplete to indicate a statement was closed
     pub(super) async fn wait_for_close_complete(&mut self, mut count: usize) -> Result<(), Error> {
@@ -157,6 +167,118 @@ impl PgConnection {
         self.inner.pending_ready_for_query_count += 1;
     }
 
+    /// A pipelined statement whose query was dropped before it was described may or may not
+    /// exist on the server: close it with the next query (closing a missing one is no error).
+    pub(super) fn queue_unconfirmed_close(&mut self) {
+        if let Some(id) = self.inner.unconfirmed_statement.take() {
+            self.inner.statements_to_close.push(id);
+        }
+    }
+
+    /// Appends `Close` for the statements waiting for it, behind their own `Sync`, after a
+    /// query already written: no round trip of their own, and their replies are drained by the
+    /// next [`wait_until_ready`][Self::wait_until_ready]. Their own `Sync` keeps an error
+    /// there out of the query's replies.
+    fn write_statements_to_close(&mut self) {
+        if self.inner.statements_to_close.is_empty() {
+            return;
+        }
+
+        for id in std::mem::take(&mut self.inner.statements_to_close) {
+            self.inner
+                .stream
+                .write_msg(Close::Statement(id))
+                .expect("BUG: Close should not be too big for protocol");
+        }
+
+        self.write_sync();
+    }
+
+    /// Caches a pipelined statement once the server has it.
+    fn confirm_statement(
+        &mut self,
+        sql: &str,
+        id: StatementId,
+        metadata: &Arc<PgStatementMetadata>,
+    ) {
+        if self.inner.unconfirmed_statement != Some(id) {
+            // unnamed, or already cached
+            return;
+        }
+
+        self.inner.unconfirmed_statement = None;
+
+        if let Some((evicted, _)) = self
+            .inner
+            .cache_statement
+            .insert(sql, (id, Arc::clone(metadata)))
+        {
+            self.inner.statements_to_close.push(evicted);
+        }
+    }
+
+    /// Writes the messages of one round trip followed by `Sync`; if any fails to encode,
+    /// none of them is sent.
+    fn write_pipeline(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let unflushed = self.inner.stream.write_buffer().get().len();
+
+        if let Err(error) = write(self) {
+            self.inner
+                .stream
+                .write_buffer_mut()
+                .truncate_unflushed(unflushed);
+
+            return Err(error);
+        }
+
+        self.write_sync();
+
+        Ok(())
+    }
+
+    fn write_bind_execute(
+        &mut self,
+        statement: StatementId,
+        arguments: &PgArguments,
+        num_params: u16,
+    ) -> Result<(), Error> {
+        // bind to attach the arguments to the statement and create a portal
+        self.inner.stream.write_msg(Bind {
+            portal: PortalId::UNNAMED,
+            statement,
+            formats: &[PgValueFormat::Binary],
+            num_params,
+            params: &arguments.buffer,
+            result_formats: &[PgValueFormat::Binary],
+        })?;
+
+        // executes the portal up to the passed limit
+        // the protocol-level limit acts nearly identically to the `LIMIT` in SQL
+        self.inner.stream.write_msg(message::Execute {
+            portal: PortalId::UNNAMED,
+            // Non-zero limits cause query plan pessimization by disabling parallel workers:
+            // https://github.com/launchbadge/sqlx/issues/3673
+            limit: 0,
+        })?;
+        // From https://www.postgresql.org/docs/current/protocol-flow.html:
+        //
+        // "An unnamed portal is destroyed at the end of the transaction, or as
+        // soon as the next Bind statement specifying the unnamed portal as
+        // destination is issued. (Note that a simple Query message also
+        // destroys the unnamed portal."
+
+        // we ask the database server to close the unnamed portal and free the associated resources
+        // earlier - after the execution of the current query.
+        self.inner
+            .stream
+            .write_msg(Close::Portal(PortalId::UNNAMED))?;
+
+        Ok(())
+    }
+
     async fn get_or_prepare(
         &mut self,
         sql: &str,
@@ -166,30 +288,32 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
         resolve_column_origin: bool,
+        // name the statement even if it will not be cached: `describe` needs a name for
+        // `EXPLAIN EXECUTE`, and closes it
+        force_named: bool,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
         if let Some(statement) = self.inner.cache_statement.get_mut(sql) {
             return Ok((*statement).clone());
         }
+
+        self.queue_unconfirmed_close();
+
+        // a named statement that is not cached would never be closed
+        let cache = persistent && self.inner.cache_statement.is_enabled();
 
         let statement = prepare(
             self,
             sql,
             parameters,
             metadata,
-            persistent,
+            cache || force_named,
             resolve_column_origin,
         )
         .await?;
 
-        if persistent && self.inner.cache_statement.is_enabled() {
+        if cache {
             if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
-                self.inner.stream.write_msg(Close::Statement(id))?;
-                self.write_sync();
-
-                self.inner.stream.flush().await?;
-
-                self.wait_for_close_complete(1).await?;
-                self.recv_ready_for_query().await?;
+                self.inner.statements_to_close.push(id);
             }
         }
 
@@ -209,7 +333,10 @@ impl PgConnection {
         // before we continue, wait until we are "ready" to accept more queries
         self.wait_until_ready().await?;
 
+        self.queue_unconfirmed_close();
+
         let mut metadata: Arc<PgStatementMetadata>;
+        let mut pipelined = None;
 
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
@@ -225,57 +352,74 @@ impl PgConnection {
                 )
             })?;
 
-            // prepare the statement if this our first time executing it
-            // always return the statement ID here
-            let (statement, metadata_) = self
-                .get_or_prepare(sql, &arguments.types, persistent, metadata_opt, false)
-                .await?;
+            if let Some((statement, cached)) = self.inner.cache_statement.get_mut(sql).cloned() {
+                metadata = cached;
 
-            metadata = metadata_;
+                // patch holes created during encoding
+                arguments.apply_patches(self, &metadata.parameters).await?;
 
-            // patch holes created during encoding
-            arguments.apply_patches(self, &metadata.parameters).await?;
+                // consume messages till `ReadyForQuery` before bind and execute
+                self.wait_until_ready().await?;
 
-            // consume messages till `ReadyForQuery` before bind and execute
-            self.wait_until_ready().await?;
+                self.write_pipeline(|conn| {
+                    conn.write_bind_execute(statement, &arguments, num_params)
+                })?;
+            } else {
+                // Parse, Describe, Bind, Execute and Sync go out together: one round trip, and
+                // nothing in between for a transaction-pooling proxy to split. So whatever may
+                // query the server (resolving type names into OIDs) happens first.
+                let param_types = self.resolve_types(&arguments.types).await?;
+                let holes = arguments.resolve_holes(self).await?;
 
-            // bind to attach the arguments to the statement and create a portal
-            self.inner.stream.write_msg(Bind {
-                portal: PortalId::UNNAMED,
-                statement,
-                formats: &[PgValueFormat::Binary],
-                num_params,
-                params: &arguments.buffer,
-                result_formats: &[PgValueFormat::Binary],
-            })?;
+                self.wait_until_ready().await?;
 
-            // executes the portal up to the passed limit
-            // the protocol-level limit acts nearly identically to the `LIMIT` in SQL
-            self.inner.stream.write_msg(message::Execute {
-                portal: PortalId::UNNAMED,
-                // Non-zero limits cause query plan pessimization by disabling parallel workers:
-                // https://github.com/launchbadge/sqlx/issues/3673
-                limit: 0,
-            })?;
-            // From https://www.postgresql.org/docs/current/protocol-flow.html:
-            //
-            // "An unnamed portal is destroyed at the end of the transaction, or as
-            // soon as the next Bind statement specifying the unnamed portal as
-            // destination is issued. (Note that a simple Query message also
-            // destroys the unnamed portal."
+                let id = if persistent && self.inner.cache_statement.is_enabled() {
+                    let id = self.inner.next_statement_id;
+                    self.inner.next_statement_id = id.next();
+                    id
+                } else {
+                    StatementId::UNNAMED
+                };
 
-            // we ask the database server to close the unnamed portal and free the associated resources
-            // earlier - after the execution of the current query.
-            self.inner
-                .stream
-                .write_msg(Close::Portal(PortalId::UNNAMED))?;
+                let describe = metadata_opt.is_none();
 
-            // finally, [Sync] asks postgres to process the messages that we sent and respond with
-            // a [ReadyForQuery] message when it's completely done. Theoretically, we could send
-            // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
-            // is still serial but it would reduce round-trips. Some kind of builder pattern that is
-            // termed batching might suit this.
-            self.write_sync();
+                // Without a statement object, the parameters are the ones declared in `Parse`:
+                // the server describes them the same.
+                metadata = metadata_opt.unwrap_or_else(|| {
+                    Arc::new(PgStatementMetadata {
+                        parameters: arguments.types.clone(),
+                        ..Default::default()
+                    })
+                });
+
+                arguments.apply_resolved_patches(&metadata.parameters, &holes);
+
+                self.write_pipeline(|conn| {
+                    conn.inner.stream.write_msg(Parse {
+                        param_types: &param_types,
+                        query: sql,
+                        statement: id,
+                    })?;
+
+                    if describe {
+                        conn.inner
+                            .stream
+                            .write_msg(message::Describe::Statement(id))?;
+                    }
+
+                    conn.write_bind_execute(id, &arguments, num_params)
+                })?;
+
+                if id != StatementId::UNNAMED {
+                    self.inner.unconfirmed_statement = Some(id);
+                }
+
+                pipelined = Some(Pipelined {
+                    id,
+                    describing: describe,
+                    parameters: None,
+                });
+            }
 
             // prepared statements are binary
             PgValueFormat::Binary
@@ -290,6 +434,8 @@ impl PgConnection {
             PgValueFormat::Text
         };
 
+        self.write_statements_to_close();
+
         self.inner.stream.flush().await?;
 
         Ok(try_stream! {
@@ -297,9 +443,115 @@ impl PgConnection {
                 let message = self.inner.stream.recv().await?;
 
                 match message.format {
-                    BackendMessageFormat::BindComplete
-                    | BackendMessageFormat::ParseComplete
-                    | BackendMessageFormat::ParameterDescription
+                    BackendMessageFormat::ParseComplete | BackendMessageFormat::BindComplete => {
+                        // a statement that was not described exists once parsed
+                        if let Some(Pipelined { id, describing: false, .. }) = pipelined {
+                            self.confirm_statement(logger.sql().as_str(), id, &metadata);
+                        }
+                    }
+
+                    BackendMessageFormat::ParameterDescription
+                        if pipelined.as_ref().is_some_and(|p| p.describing) =>
+                    {
+                        if let Some(p) = &mut pipelined {
+                            p.parameters = Some(message.decode()?);
+                        }
+                    }
+
+                    BackendMessageFormat::RowDescription | BackendMessageFormat::NoData
+                        if pipelined.as_ref().is_some_and(|p| p.describing) =>
+                    {
+                        let Some(p) = &mut pipelined else { unreachable!() };
+                        p.describing = false;
+                        let id = p.id;
+                        let parameters = p.parameters.take();
+
+                        let rows: Option<RowDescription> =
+                            if message.format == BackendMessageFormat::RowDescription {
+                                Some(message.decode()?)
+                            } else {
+                                None
+                            };
+
+                        if !self.has_unknown_types(parameters.as_ref(), rows.as_ref()) {
+                            metadata = self
+                                .resolve_statement_metadata::<false>(parameters, rows, false)
+                                .await?;
+
+                            self.confirm_statement(logger.sql().as_str(), id, &metadata);
+                            continue;
+                        }
+
+                        // A type this connection has not resolved yet: looking it up is a
+                        // query, which has to wait for this one to finish. Its rows are held
+                        // until then, so they decode with the full types as usual.
+                        let mut held = Vec::new();
+
+                        loop {
+                            let message = self.inner.stream.recv().await?;
+
+                            match message.format {
+                                BackendMessageFormat::DataRow => {
+                                    held.push(Either::Right(message.decode::<DataRow>()?));
+                                }
+
+                                BackendMessageFormat::CommandComplete => {
+                                    let cc: CommandComplete = message.decode()?;
+                                    held.push(Either::Left(cc.rows_affected()));
+                                }
+
+                                BackendMessageFormat::ReadyForQuery => {
+                                    self.handle_ready_for_query(message)?;
+                                    break;
+                                }
+
+                                BackendMessageFormat::BindComplete
+                                | BackendMessageFormat::CloseComplete
+                                | BackendMessageFormat::EmptyQueryResponse
+                                | BackendMessageFormat::PortalSuspended => {}
+
+                                _ => {
+                                    return Err(err_protocol!(
+                                        "execute: unexpected message: {:?}",
+                                        message.format
+                                    ));
+                                }
+                            }
+                        }
+
+                        // the lookup is a query of its own: keep it from closing this statement
+                        let unconfirmed = self.inner.unconfirmed_statement.take();
+                        let resolved = self
+                            .resolve_statement_metadata::<true>(parameters, rows, false)
+                            .await;
+                        self.inner.unconfirmed_statement = unconfirmed;
+
+                        metadata = resolved?;
+                        self.confirm_statement(logger.sql().as_str(), id, &metadata);
+
+                        for item in held {
+                            match item {
+                                Either::Left(rows_affected) => {
+                                    logger.increase_rows_affected(rows_affected);
+                                    r#yield!(Either::Left(PgQueryResult { rows_affected }));
+                                }
+
+                                Either::Right(data) => {
+                                    logger.increment_rows_returned();
+                                    r#yield!(Either::Right(PgRow {
+                                        data,
+                                        format,
+                                        metadata: Arc::clone(&metadata),
+                                    }));
+                                }
+                            }
+                        }
+
+                        // this query's ReadyForQuery was read above
+                        break;
+                    }
+
+                    BackendMessageFormat::ParameterDescription
                     | BackendMessageFormat::NoData
                     // unnamed portal has been closed
                     | BackendMessageFormat::CloseComplete
@@ -453,7 +705,7 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (_, metadata) = self
-                .get_or_prepare(sql.as_str(), parameters, true, None, true)
+                .get_or_prepare(sql.as_str(), parameters, true, None, true, false)
                 .await?;
 
             Ok(PgStatement { sql, metadata })
@@ -472,10 +724,17 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (stmt_id, metadata) = self
-                .get_or_prepare(sql.as_str(), &[], true, None, true)
+                .get_or_prepare(sql.as_str(), &[], true, None, true, true)
                 .await?;
 
-            let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;
+            let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await;
+
+            // named only for `EXPLAIN EXECUTE`: nothing else would close it
+            if !self.inner.cache_statement.contains_key(sql.as_str()) {
+                self.inner.statements_to_close.push(stmt_id);
+            }
+
+            let nullable = nullable?;
 
             Ok(crate::describe::Describe {
                 columns: metadata.columns.clone(),

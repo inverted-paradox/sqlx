@@ -430,6 +430,11 @@ path = "tests/postgres/types.rs"
 required-features = ["postgres"]
 
 [[test]]
+name = "postgres-pipeline"
+path = "tests/postgres/pipeline.rs"
+required-features = ["postgres", "macros"]
+
+[[test]]
 name = "postgres-describe"
 path = "tests/postgres/describe.rs"
 required-features = ["postgres"]
