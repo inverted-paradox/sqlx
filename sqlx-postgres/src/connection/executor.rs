@@ -63,17 +63,30 @@ async fn prepare(
     conn.write_statements_to_close();
     conn.inner.stream.flush().await?;
 
-    // indicates that the SQL query string is now successfully parsed and has semantic validity
-    conn.inner.stream.recv_expect::<ParseComplete>().await?;
+    // indicates that the SQL query string is now successfully parsed and has semantic validity;
+    // a proxy may leave it out and go on with the next message
+    let next = conn.inner.stream.recv().await?;
+    let next = if next.format == BackendMessageFormat::ParseComplete {
+        next.decode::<ParseComplete>()?;
+        None
+    } else {
+        Some(next)
+    };
 
     let metadata = if let Some(metadata) = metadata {
         // each SYNC produces one READY FOR QUERY
-        conn.recv_ready_for_query().await?;
+        match next {
+            Some(message) => conn.handle_ready_for_query(message)?,
+            None => conn.recv_ready_for_query().await?,
+        }
 
         // we already have metadata
         metadata
     } else {
-        let parameters = recv_desc_params(conn).await?;
+        let parameters = match next {
+            Some(message) => message.decode()?,
+            None => recv_desc_params(conn).await?,
+        };
 
         let row_desc = recv_desc_rows(conn).await?;
 
@@ -272,9 +285,11 @@ impl PgConnection {
 
         // we ask the database server to close the unnamed portal and free the associated resources
         // earlier - after the execution of the current query.
-        self.inner
-            .stream
-            .write_msg(Close::Portal(PortalId::UNNAMED))?;
+        if self.inner.close_unnamed_portal {
+            self.inner
+                .stream
+                .write_msg(Close::Portal(PortalId::UNNAMED))?;
+        }
 
         Ok(())
     }

@@ -700,3 +700,271 @@ async fn it_connects_through_a_socket_factory() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// A socket that records the messages the server sends, and can leave some out the way a
+/// proxy might.
+#[cfg(feature = "postgres-socket-factory")]
+mod tap {
+    use sqlx::postgres::{ReadBuf, Socket};
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::net::TcpStream;
+
+    pub struct Tap {
+        pub inner: TcpStream,
+        /// message types to leave out
+        pub drop: &'static [u8],
+        /// every message type received, including the ones left out
+        pub seen: Arc<Mutex<Vec<u8>>>,
+        pub received: Vec<u8>,
+        pub out: VecDeque<u8>,
+    }
+
+    impl Tap {
+        fn split_messages(&mut self) {
+            while let Some(header) = self.received.get(..5) {
+                let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+                if self.received.len() < 1 + len {
+                    break;
+                }
+
+                let message: Vec<u8> = self.received.drain(..1 + len).collect();
+                self.seen.lock().unwrap().push(message[0]);
+
+                if !self.drop.contains(&message[0]) {
+                    self.out.extend(message);
+                }
+            }
+        }
+    }
+
+    impl Socket for Tap {
+        fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
+            loop {
+                if !self.out.is_empty() {
+                    let n = std::cmp::min(self.out.len(), buf.remaining_mut());
+                    let bytes: Vec<u8> = self.out.drain(..n).collect();
+                    buf.put_slice(&bytes);
+                    return Ok(n);
+                }
+
+                let mut chunk = [0; 8192];
+                let n = self.inner.try_read(&mut chunk)?;
+                if n == 0 {
+                    return Ok(0);
+                }
+
+                self.received.extend_from_slice(&chunk[..n]);
+                self.split_messages();
+            }
+        }
+
+        fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.try_write(buf)
+        }
+
+        fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if !self.out.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+
+            self.inner.poll_read_ready(cx)
+        }
+
+        fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.inner.poll_write_ready(cx)
+        }
+
+        fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Socket::poll_shutdown(&mut self.inner, cx)
+        }
+    }
+}
+
+/// Options whose connections go through a [`tap::Tap`].
+#[cfg(feature = "postgres-socket-factory")]
+fn tapped(
+    drop: &'static [u8],
+) -> anyhow::Result<(PgConnectOptions, Arc<std::sync::Mutex<Vec<u8>>>)> {
+    use sqlx::postgres::PgSslMode;
+
+    setup_if_needed();
+    let options: PgConnectOptions = env::var("DATABASE_URL")?.parse()?;
+    let server = format!("{}:{}", options.get_host(), options.get_port());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let options = options.ssl_mode(PgSslMode::Disable).socket_factory({
+        let seen = seen.clone();
+        move || {
+            let (server, seen) = (server.clone(), seen.clone());
+            async move {
+                Ok(tap::Tap {
+                    inner: TcpStream::connect(server).await?,
+                    drop,
+                    seen,
+                    received: Vec::new(),
+                    out: Default::default(),
+                })
+            }
+        }
+    });
+
+    Ok((options, seen))
+}
+
+#[cfg(feature = "postgres-socket-factory")]
+#[sqlx_macros::test]
+async fn it_tolerates_a_missing_parse_complete() -> anyhow::Result<()> {
+    const PARSE_COMPLETE: u8 = b'1';
+
+    for capacity in [100, 0] {
+        let (options, seen) = tapped(&[PARSE_COMPLETE])?;
+        let mut conn =
+            PgConnection::connect_with(&options.statement_cache_capacity(capacity)).await?;
+
+        // pipelined, then cached (named) or parsed again (unnamed)
+        for i in 0..2_i32 {
+            let n: i32 = sqlx::query_scalar("SELECT $1::int4")
+                .bind(i)
+                .fetch_one(&mut conn)
+                .await?;
+            assert_eq!(n, i);
+        }
+
+        // a custom type looked up after the rows
+        let status: Status = sqlx::query_scalar("SELECT 'open'::status")
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(status, Status::Open);
+
+        // parsed and described, then run from the statement object
+        let statement = conn
+            .prepare("SELECT $1::int4 + 1 AS n".into_sql_str())
+            .await?;
+        assert_eq!(statement.columns().len(), 1);
+        let row = statement.query().bind(1_i32).fetch_one(&mut conn).await?;
+        assert_eq!(row.get::<i32, _>("n"), 2);
+
+        let described = (&mut conn)
+            .describe("SELECT 1 AS one".into_sql_str())
+            .await?;
+        assert_eq!(described.columns().len(), 1);
+
+        // an error still is one
+        let error = sqlx::query("SELEC 1").execute(&mut conn).await.unwrap_err();
+        assert_eq!(error.as_database_error().unwrap().code().unwrap(), "42601");
+
+        let n: i32 = sqlx::query_scalar("SELECT 3").fetch_one(&mut conn).await?;
+        assert_eq!(n, 3);
+
+        // the server did send them
+        assert!(seen.lock().unwrap().contains(&PARSE_COMPLETE));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "postgres-socket-factory")]
+#[sqlx_macros::test]
+async fn it_can_leave_the_unnamed_portal_open() -> anyhow::Result<()> {
+    const CLOSE_COMPLETE: u8 = b'3';
+
+    for close in [true, false] {
+        let (options, seen) = tapped(&[])?;
+        let options = options
+            .statement_cache_capacity(0)
+            .close_unnamed_portal(close);
+        let mut conn = PgConnection::connect_with(&options).await?;
+
+        sqlx::raw_sql("CREATE TEMPORARY TABLE pipeline_portal (id int4)")
+            .execute(&mut conn)
+            .await?;
+
+        let mut tx = conn.begin().await?;
+        for i in 0..3_i32 {
+            sqlx::query("INSERT INTO pipeline_portal VALUES ($1)")
+                .bind(i)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let ids: Vec<i32> =
+            sqlx::query_scalar("SELECT id FROM pipeline_portal WHERE id >= $1 ORDER BY id")
+                .bind(1_i32)
+                .fetch_all(&mut *tx)
+                .await?;
+        assert_eq!(ids, [1, 2]);
+        tx.commit().await?;
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pipeline_portal WHERE id < $1")
+            .bind(10_i32)
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(n, 3);
+
+        let closed = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&m| m == CLOSE_COMPLETE)
+            .count();
+        assert_eq!(closed, if close { 5 } else { 0 });
+    }
+
+    Ok(())
+}
+
+/// Through a transaction-pooling proxy (PgBouncer with `pool_mode = transaction`) set in
+/// `PGBOUNCER_URL`; skipped without it. Clients outnumber the proxy's server connections, so
+/// consecutive transactions of a client run on different ones.
+#[sqlx_macros::test]
+async fn it_runs_through_a_transaction_pooler() -> anyhow::Result<()> {
+    setup_if_needed();
+    let Ok(url) = env::var("PGBOUNCER_URL") else {
+        eprintln!("PGBOUNCER_URL not set: skipped");
+        return Ok(());
+    };
+    let options: PgConnectOptions = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
+
+    let mut clients = Vec::new();
+    for client in 0..8_i32 {
+        let options = options.clone();
+        clients.push(tokio::spawn(async move {
+            let mut conn = PgConnection::connect_with(&options).await?;
+
+            for i in 0..200_i32 {
+                // a statement of its own per client, so a mix-up would show
+                let sql = format!("SELECT $1::int4 * 1000 + {client}");
+                let n: i32 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                    .bind(i)
+                    .fetch_one(&mut conn)
+                    .await?;
+                assert_eq!(n, i * 1000 + client);
+
+                if i % 20 == 0 {
+                    let mut tx = conn.begin().await?;
+                    let status: Status = sqlx::query_scalar("SELECT $1::status")
+                        .bind(Status::Closed)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    assert_eq!(status, Status::Closed);
+                    let m: i32 = sqlx::query_scalar("SELECT $1::int4 + 1")
+                        .bind(n)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    assert_eq!(m, n + 1);
+                    tx.commit().await?;
+                }
+            }
+
+            anyhow::Ok(())
+        }));
+    }
+
+    for client in clients {
+        client.await??;
+    }
+
+    Ok(())
+}

@@ -156,6 +156,7 @@ impl PgConnection {
                     .as_ref()
                     .map(|cache| cache.database(options)),
                 log_settings: options.log_settings.clone(),
+                close_unnamed_portal: options.close_unnamed_portal,
             }),
         };
 

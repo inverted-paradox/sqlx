@@ -31,6 +31,7 @@ pub struct PgConnectOptions {
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
     pub(crate) shared_type_cache: Option<crate::PgTypeCache>,
+    pub(crate) close_unnamed_portal: bool,
     #[cfg(feature = "socket-factory")]
     pub(crate) socket_factory: Option<SocketFactory>,
 }
@@ -120,6 +121,7 @@ impl PgConnectOptions {
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
             shared_type_cache: None,
+            close_unnamed_portal: true,
             #[cfg(feature = "socket-factory")]
             socket_factory: None,
         }
@@ -374,6 +376,12 @@ impl PgConnectOptions {
     /// dropped.
     ///
     /// The default cache capacity is 100 statements.
+    ///
+    /// A capacity of 0 disables the cache: every statement is then unnamed, parsed again by
+    /// each query in the same round trip that runs it. Use it behind a transaction-pooling
+    /// proxy (PgBouncer in transaction mode, Cloudflare Hyperdrive), where consecutive
+    /// transactions may run on different server connections and a named statement prepared
+    /// on one would be missing on the next.
     pub fn statement_cache_capacity(mut self, capacity: usize) -> Self {
         self.statement_cache_capacity = capacity;
         self
@@ -428,6 +436,17 @@ impl PgConnectOptions {
             let socket = factory();
             Box::pin(async move { Ok(Box::new(socket.await?) as Box<dyn crate::net::Socket>) })
         })));
+        self
+    }
+
+    /// Whether a query closes the unnamed portal it ran (`Close` before `Sync`) to free its
+    /// resources at once. Defaults to `true`.
+    ///
+    /// Some transaction-pooling proxies reject `Close`. Without it the unnamed portal lives
+    /// until the transaction ends (at `Sync`, outside a transaction block) or the next query
+    /// replaces it, as PostgreSQL specifies; results are the same.
+    pub fn close_unnamed_portal(mut self, close: bool) -> Self {
+        self.close_unnamed_portal = close;
         self
     }
 

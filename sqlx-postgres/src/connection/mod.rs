@@ -87,6 +87,7 @@ pub struct PgConnectionInner {
     pub(crate) transaction_depth: usize,
 
     log_settings: LogSettings,
+    close_unnamed_portal: bool,
 }
 
 pub(crate) struct TableData {
