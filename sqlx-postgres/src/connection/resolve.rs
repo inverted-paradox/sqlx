@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::message::{ParameterDescription, RowDescription};
 use crate::statement::PgStatementMetadata;
+use crate::type_cache::{lock, TypeMaps};
 use crate::type_info::{PgCustomType, PgType, PgTypeKind};
 use crate::types::Oid;
 use crate::{HashMap, PgRow, PgValueRef, Postgres};
@@ -38,6 +39,14 @@ impl PgConnection {
         let fields = row_desc.map_or_else(Default::default, |desc| desc.fields);
 
         if QUERIES_ALLOWED {
+            if param_types
+                .iter()
+                .chain(fields.iter().map(|field| &field.data_type_id))
+                .any(|oid| self.try_oid_to_type(*oid).is_none())
+            {
+                self.pull_shared_types();
+            }
+
             let mut type_resolver = TypeResolver::default();
             let mut column_resolver = ColumnResolver::default();
 
@@ -135,6 +144,11 @@ impl PgConnection {
     }
 
     pub(crate) async fn resolve_types(&mut self, types: &[PgTypeInfo]) -> Result<Vec<Oid>, Error> {
+        // another connection may have resolved what this one has not
+        if types.iter().any(|ty| self.try_type_to_oid(ty).is_none()) {
+            self.pull_shared_types();
+        }
+
         let mut oids = Vec::with_capacity(types.len());
 
         let mut unresolved_types = types.iter().peekable();
@@ -211,9 +225,10 @@ impl PgConnection {
         }
     }
 
-    /// Whether a parameter or column is of a type this connection has not resolved yet.
+    /// Whether a parameter or column is of a type this connection has not resolved yet, nor
+    /// another connection sharing its types.
     pub(crate) fn has_unknown_types(
-        &self,
+        &mut self,
         param_desc: Option<&ParameterDescription>,
         row_desc: Option<&RowDescription>,
     ) -> bool {
@@ -222,9 +237,49 @@ impl PgConnection {
             .into_iter()
             .flat_map(|desc| desc.fields.iter().map(|field| &field.data_type_id));
 
-        params
-            .chain(columns)
-            .any(|oid| self.try_oid_to_type(*oid).is_none())
+        let oids: Vec<Oid> = params.chain(columns).copied().collect();
+        let unknown = |conn: &Self| oids.iter().any(|oid| conn.try_oid_to_type(*oid).is_none());
+
+        unknown(self) && (!self.pull_shared_types() || unknown(self))
+    }
+
+    /// Copies what other connections resolved into this connection's types; returns whether
+    /// anything was new.
+    pub(crate) fn pull_shared_types(&mut self) -> bool {
+        let Some(shared) = self.inner.shared_types.clone() else {
+            return false;
+        };
+
+        let mut local = self.take_types();
+        let new = local.merge_from(&lock(&shared));
+        self.put_types(local);
+
+        new
+    }
+
+    /// Writes what this connection resolved to the types it shares.
+    fn push_shared_types(&mut self) {
+        let Some(shared) = self.inner.shared_types.clone() else {
+            return;
+        };
+
+        let local = self.take_types();
+        lock(&shared).merge_from(&local);
+        self.put_types(local);
+    }
+
+    fn take_types(&mut self) -> TypeMaps {
+        TypeMaps {
+            type_oid: mem::take(&mut self.inner.cache_type_oid),
+            type_info: mem::take(&mut self.inner.cache_type_info),
+            elem_type_to_array: mem::take(&mut self.inner.cache_elem_type_to_array),
+        }
+    }
+
+    fn put_types(&mut self, types: TypeMaps) {
+        self.inner.cache_type_oid = types.type_oid;
+        self.inner.cache_type_info = types.type_info;
+        self.inner.cache_elem_type_to_array = types.elem_type_to_array;
     }
 
     fn try_oid_to_type(&self, oid: Oid) -> Option<PgTypeInfo> {
@@ -413,6 +468,10 @@ impl TypeResolver {
     }
 
     async fn fill_cache(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+        if self.query.is_empty() {
+            return Ok(());
+        }
+
         let mut missing_dependencies = HashMap::<Oid, Vec<TypeResolverRow>>::new();
 
         // Iteratively resolve types until all are resolved, or we hit a dead-end.
@@ -484,6 +543,9 @@ impl TypeResolver {
                 }
             }
         }
+
+        // what did resolve is shared even if something did not
+        conn.push_shared_types();
 
         if !missing_dependencies.is_empty() {
             return Err(Error::Protocol(format!(

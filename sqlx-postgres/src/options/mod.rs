@@ -30,6 +30,7 @@ pub struct PgConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) shared_type_cache: Option<crate::PgTypeCache>,
 }
 
 impl Default for PgConnectOptions {
@@ -97,6 +98,7 @@ impl PgConnectOptions {
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            shared_type_cache: None,
         }
     }
 
@@ -351,6 +353,25 @@ impl PgConnectOptions {
     /// The default cache capacity is 100 statements.
     pub fn statement_cache_capacity(mut self, capacity: usize) -> Self {
         self.statement_cache_capacity = capacity;
+        self
+    }
+
+    /// Shares the custom types (enums, domains, composites...) connections look up in `pg_type`
+    /// with every other connection given the same [`PgTypeCache`][crate::PgTypeCache], so a
+    /// new connection does not look them up again.
+    ///
+    /// By default each connection has its own. A pool clones its options for every
+    /// connection, so a cache set here serves the whole pool.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx_postgres::{PgConnectOptions, PgTypeCache};
+    /// let options = PgConnectOptions::new()
+    ///     .shared_type_cache(PgTypeCache::new());
+    /// ```
+    pub fn shared_type_cache(mut self, cache: crate::PgTypeCache) -> Self {
+        self.shared_type_cache = Some(cache);
         self
     }
 

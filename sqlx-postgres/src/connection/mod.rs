@@ -15,6 +15,7 @@ use crate::message::{
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
+use crate::type_cache::SharedTypes;
 use crate::types::Oid;
 use crate::{PgConnectOptions, PgTypeInfo, Postgres};
 
@@ -74,6 +75,9 @@ pub struct PgConnectionInner {
     cache_type_oid: HashMap<UStr, Oid>,
     cache_elem_type_to_array: HashMap<Oid, Oid>,
     cache_table_data: HashMap<Oid, TableData>,
+
+    // the types of this database shared with other connections, if any
+    shared_types: Option<SharedTypes>,
 
     // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,

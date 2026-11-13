@@ -135,7 +135,7 @@ impl PgConnection {
             }
         }
 
-        Ok(PgConnection {
+        let mut conn = PgConnection {
             inner: Box::new(PgConnectionInner {
                 stream,
                 process_id,
@@ -151,8 +151,16 @@ impl PgConnection {
                 cache_type_info: HashMap::new(),
                 cache_elem_type_to_array: HashMap::new(),
                 cache_table_data: HashMap::new(),
+                shared_types: options
+                    .shared_type_cache
+                    .as_ref()
+                    .map(|cache| cache.database(options)),
                 log_settings: options.log_settings.clone(),
             }),
-        })
+        };
+
+        conn.pull_shared_types();
+
+        Ok(conn)
     }
 }

@@ -5,7 +5,9 @@
 #![cfg(feature = "_rt-tokio")]
 
 use futures_util::{StreamExt, TryStreamExt};
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgDatabaseError, PgRow};
+use sqlx::postgres::{
+    PgConnectOptions, PgConnection, PgDatabaseError, PgPoolOptions, PgRow, PgTypeCache,
+};
 use sqlx::{Column, Connection, Executor, Row, SqlSafeStr, Statement, TypeInfo};
 use sqlx_test::setup_if_needed;
 use std::env;
@@ -474,6 +476,75 @@ async fn it_reuses_a_prepared_statement_object() -> anyhow::Result<()> {
     assert_eq!(proxy.take(), 2);
     assert_eq!(other.cached_statements_size(), 1);
     assert_eq!(prepared_statements(&mut other).await?, 1);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_shares_resolved_types_between_connections() -> anyhow::Result<()> {
+    let proxy = Proxy::start().await?;
+    let cache = PgTypeCache::new();
+    let shared = proxy.options.clone().shared_type_cache(cache.clone());
+
+    // an enum parameter, and enum, composite, range and array columns
+    async fn run(conn: &mut PgConnection) -> anyhow::Result<Vec<String>> {
+        let row = sqlx::query(
+            "SELECT $1 AS status, ROW('pen', 1, 2)::inventory_item AS item, \
+             '[1.5,2.5]'::float_range AS range, ARRAY[$1] AS statuses",
+        )
+        .bind(Status::Open)
+        .fetch_one(conn)
+        .await?;
+
+        assert_eq!(row.try_get::<Status, _>("status")?, Status::Open);
+
+        Ok(row
+            .columns()
+            .iter()
+            .map(|column| column.type_info().name().to_owned())
+            .collect())
+    }
+
+    // the first connection looks the types up
+    let mut first = PgConnection::connect_with(&shared).await?;
+    proxy.take();
+    let types = run(&mut first).await?;
+    assert!(proxy.take() > 1);
+    assert_eq!(
+        types,
+        ["status", "inventory_item", "float_range", "status[]"]
+    );
+
+    // a new connection sharing them does not
+    let mut second = PgConnection::connect_with(&shared).await?;
+    proxy.take();
+    assert_eq!(run(&mut second).await?, types);
+    assert_eq!(proxy.take(), 1);
+
+    // nor a new pool
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(shared.clone())
+        .await?;
+    let mut pooled = pool.acquire().await?;
+    proxy.take();
+    assert_eq!(run(&mut pooled).await?, types);
+    assert_eq!(proxy.take(), 1);
+    drop(pooled);
+    pool.close().await;
+
+    // without the cache, a new connection looks them up again
+    let mut alone = proxy.connect().await?;
+    proxy.take();
+    assert_eq!(run(&mut alone).await?, types);
+    assert!(proxy.take() > 1);
+
+    // once cleared, they are looked up again
+    cache.clear();
+    let mut third = PgConnection::connect_with(&shared).await?;
+    proxy.take();
+    assert_eq!(run(&mut third).await?, types);
+    assert!(proxy.take() > 1);
 
     Ok(())
 }
