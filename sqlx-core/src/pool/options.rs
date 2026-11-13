@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 /// the perspectives of both API designer and consumer.
 pub struct PoolOptions<DB: Database> {
     pub(crate) test_before_acquire: bool,
+    pub(crate) test_on_release: bool,
     pub(crate) after_connect: Option<
         Arc<
             dyn Fn(&mut DB::Connection, PoolConnectionMetadata) -> BoxFuture<'_, Result<(), Error>>
@@ -94,6 +95,7 @@ impl<DB: Database> Clone for PoolOptions<DB> {
     fn clone(&self) -> Self {
         PoolOptions {
             test_before_acquire: self.test_before_acquire,
+            test_on_release: self.test_on_release,
             after_connect: self.after_connect.clone(),
             before_acquire: self.before_acquire.clone(),
             after_release: self.after_release.clone(),
@@ -147,6 +149,7 @@ impl<DB: Database> PoolOptions<DB> {
             before_acquire: None,
             after_release: None,
             test_before_acquire: true,
+            test_on_release: true,
             // A production application will want to set a higher limit than this.
             max_connections: 10,
             min_connections: 0,
@@ -319,6 +322,26 @@ impl<DB: Database> PoolOptions<DB> {
     /// Get whether `test_before_acquire` is currently set.
     pub fn get_test_before_acquire(&self) -> bool {
         self.test_before_acquire
+    }
+
+    /// If true, a released connection is checked with [`Connection::ping`] (a round trip)
+    /// before it goes back into the pool.
+    ///
+    /// If false, it is only brought back to a ready state: anything queued is sent (such as
+    /// the `ROLLBACK` of a dropped transaction) and the rest of an unfinished query is read,
+    /// which needs no round trip on a connection that is already ready. A connection that
+    /// fails this is closed either way; a connection that silently died is then found by
+    /// [`test_before_acquire`][Self::test_before_acquire] or on its next use.
+    ///
+    /// Defaults to `true`.
+    pub fn test_on_release(mut self, test: bool) -> Self {
+        self.test_on_release = test;
+        self
+    }
+
+    /// Get whether `test_on_release` is currently set.
+    pub fn get_test_on_release(&self) -> bool {
+        self.test_on_release
     }
 
     /// If set to `true`, calls to `acquire()` are fair and connections  are issued
@@ -591,6 +614,7 @@ impl<DB: Database> Debug for PoolOptions<DB> {
             .field("max_lifetime", &self.max_lifetime)
             .field("idle_timeout", &self.idle_timeout)
             .field("test_before_acquire", &self.test_before_acquire)
+            .field("test_on_release", &self.test_on_release)
             .finish()
     }
 }

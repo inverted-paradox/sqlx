@@ -548,3 +548,101 @@ async fn it_shares_resolved_types_between_connections() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[sqlx_macros::test]
+async fn it_skips_the_pings_of_a_pool() -> anyhow::Result<()> {
+    let proxy = Proxy::start().await?;
+
+    for (test_before_acquire, test_on_release, per_use) in
+        [(true, true, 3), (false, true, 2), (false, false, 1)]
+    {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .test_before_acquire(test_before_acquire)
+            .test_on_release(test_on_release)
+            .connect_with(proxy.options.clone())
+            .await?;
+
+        // the connection exists and its statement is cached
+        let mut conn = pool.acquire().await?;
+        sqlx::query("SELECT $1::int4")
+            .bind(0_i32)
+            .execute(&mut *conn)
+            .await?;
+        drop(conn);
+        // waits for that release
+        let conn = pool.acquire().await?;
+        proxy.take();
+        drop(conn);
+
+        for i in 1..=5_i32 {
+            let mut conn = pool.acquire().await?;
+            let n: i32 = sqlx::query_scalar("SELECT $1::int4")
+                .bind(i)
+                .fetch_one(&mut *conn)
+                .await?;
+            assert_eq!(n, i);
+        }
+
+        // waits for the last release
+        let conn = pool.acquire().await?;
+        // the first release, five uses, the last acquire
+        let expected =
+            usize::from(test_on_release) + 5 * per_use + usize::from(test_before_acquire);
+        assert_eq!(
+            proxy.take(),
+            expected,
+            "test_before_acquire({test_before_acquire}), test_on_release({test_on_release})"
+        );
+        drop(conn);
+        pool.close().await;
+    }
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_rolls_back_a_dropped_transaction_without_a_ping() -> anyhow::Result<()> {
+    let proxy = Proxy::start().await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .test_on_release(false)
+        .connect_with(proxy.options.clone())
+        .await?;
+
+    let mut conn = pool.acquire().await?;
+    sqlx::raw_sql("CREATE TEMPORARY TABLE pipeline_release (id int4)")
+        .execute(&mut *conn)
+        .await?;
+    let mut tx = conn.begin().await?;
+    sqlx::query("INSERT INTO pipeline_release VALUES ($1)")
+        .bind(1_i32)
+        .execute(&mut *tx)
+        .await?;
+    drop(tx);
+    drop(conn);
+
+    let mut conn = pool.acquire().await?;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM pipeline_release")
+        .fetch_one(&mut *conn)
+        .await?;
+    assert_eq!(rows, 0);
+
+    // a stream dropped part-way is drained on release
+    let mut s = sqlx::query("SELECT generate_series(1, $1::int4)")
+        .bind(10_000_i32)
+        .fetch(&mut *conn);
+    s.try_next().await?;
+    drop(s);
+    drop(conn);
+
+    let mut conn = pool.acquire().await?;
+    let n: i32 = sqlx::query_scalar("SELECT $1::int4")
+        .bind(2_i32)
+        .fetch_one(&mut *conn)
+        .await?;
+    assert_eq!(n, 2);
+
+    Ok(())
+}
