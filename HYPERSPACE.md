@@ -139,6 +139,11 @@ sqlx-macros = { git = "https://github.com/inverted-paradox/sqlx", branch = "hype
 sqlx-macros-core = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
 ```
 
+- In the root `Cargo.toml`, not `.cargo/worker.toml`: the patch applies to every build, and the
+  Worker's lockfile is derived from `Cargo.lock`. The overlay keeps only tokio, tokio-macros and mio.
+- Checked on Hyperspace `a6fb85f` (tokio `=1.54.1`) with these lines: `cargo check --workspace
+  --all-targets` and `just wasm` (`worker_check`, `wasm32-unknown-emscripten` with the tokio and
+  mio forks) pass, with and without `postgres-socket-factory`.
 - `sqlx` stays `0.9.0` with its features; add `postgres-socket-factory` only where a socket
   factory is used (the Worker, later).
 - One `PgTypeCache` per process, cloned into the `PgConnectOptions` of every pool:
