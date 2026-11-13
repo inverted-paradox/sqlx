@@ -31,6 +31,27 @@ pub struct PgConnectOptions {
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
     pub(crate) shared_type_cache: Option<crate::PgTypeCache>,
+    #[cfg(feature = "socket-factory")]
+    pub(crate) socket_factory: Option<SocketFactory>,
+}
+
+/// Makes the byte stream of a new connection.
+#[cfg(feature = "socket-factory")]
+#[derive(Clone)]
+pub(crate) struct SocketFactory(pub(crate) std::sync::Arc<MakeSocket>);
+
+#[cfg(feature = "socket-factory")]
+type MakeSocket = dyn Fn() -> SocketFuture + Send + Sync;
+
+#[cfg(feature = "socket-factory")]
+type SocketFuture =
+    futures_core::future::BoxFuture<'static, std::io::Result<Box<dyn crate::net::Socket>>>;
+
+#[cfg(feature = "socket-factory")]
+impl fmt::Debug for SocketFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketFactory")
+    }
 }
 
 impl Default for PgConnectOptions {
@@ -99,6 +120,8 @@ impl PgConnectOptions {
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
             shared_type_cache: None,
+            #[cfg(feature = "socket-factory")]
+            socket_factory: None,
         }
     }
 
@@ -372,6 +395,39 @@ impl PgConnectOptions {
     /// ```
     pub fn shared_type_cache(mut self, cache: crate::PgTypeCache) -> Self {
         self.shared_type_cache = Some(cache);
+        self
+    }
+
+    /// Supplies the byte stream of every new connection made with these options, in place of
+    /// the TCP or Unix socket SQLx would open: for a platform that only lends its own sockets.
+    ///
+    /// The factory is called once per connection and must return a new, independent stream
+    /// to the server. SQLx then speaks PostgreSQL over it as usual: TLS as `ssl_mode` says
+    /// (`host` names the server for TLS; disable it when the platform's stream is already
+    /// secured), then startup and authentication. Host, port and socket are not used to
+    /// connect.
+    ///
+    /// The factory is not part of [`to_url_lossy`][sqlx_core::connection::ConnectOptions::to_url_lossy].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // with Tokio
+    /// let options = PgConnectOptions::new()
+    ///     .ssl_mode(PgSslMode::Disable)
+    ///     .socket_factory(|| tokio::net::TcpStream::connect("127.0.0.1:5432"));
+    /// ```
+    #[cfg(feature = "socket-factory")]
+    pub fn socket_factory<F, Fut, S>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::io::Result<S>> + Send + 'static,
+        S: crate::net::Socket,
+    {
+        self.socket_factory = Some(SocketFactory(std::sync::Arc::new(move || {
+            let socket = factory();
+            Box::pin(async move { Ok(Box::new(socket.await?) as Box<dyn crate::net::Socket>) })
+        })));
         self
     }
 

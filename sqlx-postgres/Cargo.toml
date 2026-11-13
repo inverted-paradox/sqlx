@@ -15,6 +15,9 @@ json = ["dep:serde", "dep:serde_json", "sqlx-core/json"]
 migrate = ["sqlx-core/migrate", "dep:crc"]
 offline = ["json", "sqlx-core/offline", "smallvec/serde"]
 
+# `PgConnectOptions::socket_factory`: the connection's byte stream supplied by the application
+socket-factory = []
+
 # Type Integration features
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "sqlx-core/bigdecimal"]
 bit-vec = ["dep:bit-vec", "sqlx-core/bit-vec"]

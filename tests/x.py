@@ -257,7 +257,7 @@ for runtime in RUNTIMES:
         for version in POSTGRES_VERSIONS:
             run(
                 f"cargo test --no-default-features "
-                f"--features any,postgres,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
+                f"--features any,postgres,postgres-socket-factory,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
                 comment=f"test postgres {version}",
                 env=postgres_env(version),
                 service=f"postgres_{version}",
@@ -268,7 +268,7 @@ for runtime in RUNTIMES:
                 ## +ssl
                 run(
                     f"cargo test --no-default-features "
-                    f"--features any,postgres,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
+                    f"--features any,postgres,postgres-socket-factory,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
                     comment=f"test postgres {version} ssl",
                     database_url_args="sslmode=verify-ca&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt",
                     env=postgres_env(version),
@@ -279,7 +279,7 @@ for runtime in RUNTIMES:
                 ## +client-ssl
                 run(
                     f"cargo test --no-default-features "
-                    f"--features any,postgres,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
+                    f"--features any,postgres,postgres-socket-factory,macros,migrate,_unstable-all-types,runtime-{runtime},tls-{tls}",
                     comment=f"test postgres {version}_client_ssl no-password",
                     database_url_args="sslmode=verify-ca&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt&sslkey=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&sslcert=.%2Ftests%2Fcerts%2Fclient.crt",
                     env=postgres_env(version),

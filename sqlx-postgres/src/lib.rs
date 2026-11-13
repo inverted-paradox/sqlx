@@ -67,6 +67,10 @@ pub use type_info::{PgTypeInfo, PgTypeKind};
 pub use types::PgHasArrayType;
 pub use value::{PgValue, PgValueFormat, PgValueRef};
 
+/// What a [`PgConnectOptions::socket_factory`] supplies.
+#[cfg(feature = "socket-factory")]
+pub use sqlx_core::{io::ReadBuf, net::Socket};
+
 /// An alias for [`Pool`][crate::pool::Pool], specialized for Postgres.
 pub type PgPool = crate::pool::Pool<Postgres>;
 

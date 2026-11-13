@@ -90,6 +90,7 @@ _unstable-all-types = [
 _unstable-docs = [
     "all-databases",
     "_unstable-all-types",
+    "postgres-socket-factory",
     "sqlx-sqlite/_unstable-docs"
 ]
 
@@ -121,6 +122,8 @@ _sqlite = []
 any = ["sqlx-core/any", "sqlx-mysql?/any", "sqlx-postgres?/any", "sqlx-sqlite?/any"]
 postgres = ["sqlx-postgres", "sqlx-macros?/postgres"]
 mysql = ["sqlx-mysql", "sqlx-macros?/mysql"]
+# `PgConnectOptions::socket_factory`: the connection's byte stream supplied by the application
+postgres-socket-factory = ["postgres", "sqlx-postgres/socket-factory"]
 mysql-rsa = ["mysql", "sqlx-mysql/rsa", "sqlx-macros?/mysql-rsa"]
 sqlite = ["sqlite-bundled", "sqlite-deserialize", "sqlite-load-extension", "sqlite-unlock-notify"]
 

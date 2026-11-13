@@ -646,3 +646,57 @@ async fn it_rolls_back_a_dropped_transaction_without_a_ping() -> anyhow::Result<
 
     Ok(())
 }
+
+#[cfg(feature = "postgres-socket-factory")]
+#[sqlx_macros::test]
+async fn it_connects_through_a_socket_factory() -> anyhow::Result<()> {
+    use sqlx::postgres::PgSslMode;
+
+    setup_if_needed();
+    let options: PgConnectOptions = env::var("DATABASE_URL")?.parse()?;
+    let server = format!("{}:{}", options.get_host(), options.get_port());
+    let made = Arc::new(AtomicUsize::new(0));
+
+    let options = options
+        // nowhere: the factory makes the connection
+        .host("invalid.")
+        .port(1)
+        .ssl_mode(PgSslMode::Disable)
+        .socket_factory({
+            let made = made.clone();
+            move || {
+                made.fetch_add(1, Ordering::SeqCst);
+                TcpStream::connect(server.clone())
+            }
+        });
+
+    let mut conn = PgConnection::connect_with(&options).await?;
+    let n: i32 = sqlx::query_scalar("SELECT $1::int4")
+        .bind(4_i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(n, 4);
+    assert_eq!(made.load(Ordering::SeqCst), 1);
+    conn.close().await?;
+
+    // every connection of a pool
+    let pool = PgPoolOptions::new()
+        .min_connections(2)
+        .max_connections(2)
+        .connect_with(options.clone())
+        .await?;
+    let (mut a, mut b) = (pool.acquire().await?, pool.acquire().await?);
+    sqlx::query("SELECT 1").execute(&mut *a).await?;
+    sqlx::query("SELECT 1").execute(&mut *b).await?;
+    assert_eq!(made.load(Ordering::SeqCst), 3);
+    drop((a, b));
+    pool.close().await;
+
+    // a factory error is the connection's
+    let failing = options
+        .socket_factory(|| async { Err::<TcpStream, _>(std::io::Error::other("no socket here")) });
+    let error = PgConnection::connect_with(&failing).await.unwrap_err();
+    assert!(error.to_string().contains("no socket here"), "{error}");
+
+    Ok(())
+}

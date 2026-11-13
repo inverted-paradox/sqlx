@@ -42,6 +42,16 @@ pub struct PgStream {
 
 impl PgStream {
     pub(super) async fn connect(options: &PgConnectOptions) -> Result<Self, Error> {
+        #[cfg(feature = "socket-factory")]
+        if let Some(factory) = &options.socket_factory {
+            use crate::net::WithSocket;
+
+            let socket = FactorySocket((factory.0)().await?);
+            let socket = MaybeUpgradeTls(options).with_socket(socket).await?;
+
+            return Ok(Self::new(socket));
+        }
+
         let socket_result = match options.fetch_socket() {
             Some(ref path) => net::connect_uds(path, MaybeUpgradeTls(options)).await?,
             None => net::connect_tcp(&options.host, options.port, MaybeUpgradeTls(options)).await?,
@@ -49,12 +59,16 @@ impl PgStream {
 
         let socket = socket_result?;
 
-        Ok(Self {
+        Ok(Self::new(socket))
+    }
+
+    fn new(socket: Box<dyn Socket>) -> Self {
+        Self {
             inner: BufferedSocket::new(socket),
             notifications: None,
             parameter_statuses: BTreeMap::default(),
             server_version_num: None,
-        })
+        }
     }
 
     #[inline(always)]
@@ -278,5 +292,49 @@ mod tests {
         assert_eq!(parse_server_version("13devel87"), Some(130000));
         // unknown
         assert_eq!(parse_server_version("unknown"), None);
+    }
+}
+
+/// A sized socket for TLS to wrap: `Box<dyn Socket>` itself makes its future
+/// "not general enough" to be `Send`.
+#[cfg(feature = "socket-factory")]
+struct FactorySocket(Box<dyn Socket>);
+
+#[cfg(feature = "socket-factory")]
+impl Socket for FactorySocket {
+    fn try_read(&mut self, buf: &mut dyn crate::io::ReadBuf) -> std::io::Result<usize> {
+        self.0.try_read(buf)
+    }
+
+    fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.try_write(buf)
+    }
+
+    fn poll_read_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_read_ready(cx)
+    }
+
+    fn poll_write_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_write_ready(cx)
+    }
+
+    fn poll_flush(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_shutdown(cx)
     }
 }
