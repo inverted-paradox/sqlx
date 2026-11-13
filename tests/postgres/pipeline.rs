@@ -602,6 +602,28 @@ async fn it_skips_the_pings_of_a_pool() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
+async fn it_reuses_a_released_connection_on_a_current_thread_runtime() -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .test_before_acquire(false)
+        .test_on_release(false)
+        .connect_lazy_with(env::var("DATABASE_URL")?.parse::<PgConnectOptions>()?);
+
+    // each query releases its connection as it ends; the next one waits for it, not a new one
+    for i in 1..=5_i32 {
+        let n: i32 = sqlx::query_scalar("SELECT $1::int4")
+            .bind(i)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(n, i);
+    }
+    assert_eq!(pool.size(), 1);
+
+    pool.close().await;
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn it_rolls_back_a_dropped_transaction_without_a_ping() -> anyhow::Result<()> {
     let proxy = Proxy::start().await?;
     let pool = PgPoolOptions::new()

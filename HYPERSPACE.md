@@ -49,6 +49,13 @@ below, for Hyperspace (Jira HS-60). One commit per change; each has tests in SQL
      (`prepare`, `describe`); the pipeline never needed it.
    - PgBouncer needs `ignore_startup_parameters = extra_float_digits` (stock SQLx too).
 
+6. **A released connection waited for** (`pool: yield before opening a connection`).
+   A connection goes back to the pool in a task spawned when it drops. On a current-thread runtime
+   (the Worker's: one event loop per request) that task cannot run before the next `acquire`
+   yields, so every sequential query opened a connection of its own (a new Hyperdrive connection,
+   a round trip, per query). `acquire` now yields once when nothing is idle but a connection
+   exists. Found by Hyperspace's request pool test (HS-62), as Aristotle's fork had found it.
+
 Plus, cherry-picked with their author kept, **the maintainer's contribution** to the Aristotle fork
 (`sam-rusty/sqlx`, PR #1 `fix/postgres-outer-join-nullability`, 2026-11-02): `query!` nullability
 of outer joins. The planner often runs `a LEFT JOIN b` as a `Right` join hashing `a`; SQLx marked
@@ -62,8 +69,7 @@ Read for what it changed and why; written again here. Differences:
 
 - Pipelines named statements too (it kept the two-step flow for them), with `Describe` of the
   statement, so cached statements keep server-described parameter types.
-- No `timezone(Option)` option, no `yield_now` in `acquire` (current-thread runtimes: revisit for
-  the Worker), no `close_named_statements` (unnamed via capacity 0 instead), no
+- No `timezone(Option)` option, no `close_named_statements` (unnamed via capacity 0 instead), no
   `allow_missing_parse_complete` option (always tolerated).
 - The type cache keeps databases apart instead of trusting one cache per database.
 - The socket factory is behind a feature and returns `io::Result`.
@@ -83,7 +89,7 @@ cargo test -p sqlx-postgres --lib --features offline,json
 
 On 2026-11-13, Postgres 18.6 and PgBouncer 1.26.1 (`default_pool_size = 2`,
 `max_prepared_statements = 0`): every Postgres target passes (`postgres-pipeline`: 19 tests),
-as do the `sqlx-postgres` unit tests. Other runtimes and TLS backends were only compiled.
+as do the `sqlx-postgres` unit tests. On 2026-11-13 again with change 6: 20 tests. Other runtimes and TLS backends were only compiled.
 
 ## Measurements
 
@@ -158,7 +164,7 @@ sqlx-macros-core = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.
 ## Tags
 
 - `<sqlx version>-hyperspace.<n>`: `0.9.0-hyperspace.1` is the first release of this branch on
-  SQLx 0.9.0. Annotated and signed, on the branch head, pushed; never moved or deleted (lock files
+  SQLx 0.9.0; `0.9.0-hyperspace.2` adds change 6. Annotated and signed, on the branch head, pushed; never moved or deleted (lock files
   pin its commit).
 - A change here: commit it to the branch (with its tests), push, tag the head with the next `<n>`,
   push the tag, then move Hyperspace's five `[patch]` lines to it in one commit with its

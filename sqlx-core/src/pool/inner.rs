@@ -258,6 +258,13 @@ impl<DB: Database> PoolInner<DB> {
                     // Handles the close-event internally
                     let permit = self.acquire_permit().await?;
 
+                    // Nothing idle, but a connection exists: it may be on its way back, in the
+                    // `return_to_pool()` task spawned when it was dropped. On a current-thread
+                    // runtime (a Worker's) that task cannot run before this one yields, and every
+                    // sequential query would open a connection of its own.
+                    if self.num_idle() == 0 && self.size() > 0 {
+                        crate::rt::yield_now().await;
+                    }
 
                     // First attempt to pop a connection from the idle queue.
                     let guard = match self.pop_idle(permit) {
