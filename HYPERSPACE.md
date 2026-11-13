@@ -132,13 +132,15 @@ different client's unnamed statement). Fork: 0 failed.
 
 ```toml
 [patch.crates-io]
-sqlx = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
-sqlx-core = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
-sqlx-postgres = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
-sqlx-macros = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
-sqlx-macros-core = { git = "https://github.com/inverted-paradox/sqlx", branch = "hyperspace" }
+sqlx = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.9.0-hyperspace.1" }
+sqlx-core = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.9.0-hyperspace.1" }
+sqlx-postgres = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.9.0-hyperspace.1" }
+sqlx-macros = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.9.0-hyperspace.1" }
+sqlx-macros-core = { git = "https://github.com/inverted-paradox/sqlx", tag = "0.9.0-hyperspace.1" }
 ```
 
+- A tag, never the branch: a later push to `hyperspace` cannot change what a Hyperspace build
+  resolves, and `Cargo.lock` names the tag's commit.
 - In the root `Cargo.toml`, not `.cargo/worker.toml`: the patch applies to every build, and the
   Worker's lockfile is derived from `Cargo.lock`. The overlay keeps only tokio, tokio-macros and mio.
 - Checked on Hyperspace `a6fb85f` (tokio `=1.54.1`) with these lines: `cargo check --workspace
@@ -153,6 +155,21 @@ sqlx-macros-core = { git = "https://github.com/inverted-paradox/sqlx", branch = 
 - Behind PgBouncer or Hyperdrive: `.statement_cache_capacity(0)`; `.close_unnamed_portal(false)`
   only if the proxy rejects `Close` (untested against Hyperdrive).
 
+## Tags
+
+- `<sqlx version>-hyperspace.<n>`: `0.9.0-hyperspace.1` is the first release of this branch on
+  SQLx 0.9.0. Annotated and signed, on the branch head, pushed; never moved or deleted (lock files
+  pin its commit).
+- A change here: commit it to the branch (with its tests), push, tag the head with the next `<n>`,
+  push the tag, then move Hyperspace's five `[patch]` lines to it in one commit with its
+  `Cargo.lock`.
+- A new SQLx release (below): its branch's first tag is `<version>-hyperspace.1`.
+
+```sh
+git tag -s 0.9.0-hyperspace.2 -m "SQLx 0.9.0 for Hyperspace: <what changed>" hyperspace
+git push origin hyperspace 0.9.0-hyperspace.2
+```
+
 ## Rebasing on a new SQLx release
 
 ```sh
@@ -161,8 +178,8 @@ git switch -c hyperspace-<version> hyperspace
 git rebase --onto v<version> v0.9.0
 ```
 
-Keep `hyperspace` as it is so existing lock files still resolve; point the `[patch]` at the new
-branch. Expect conflicts in `sqlx-postgres/src/connection/executor.rs`, where `main` already has
+Keep `hyperspace` and its tags as they are so existing lock files still resolve; tag the new
+branch's head `<version>-hyperspace.1` and point the `[patch]` at that tag. Expect conflicts in `sqlx-postgres/src/connection/executor.rs`, where `main` already has
 launchbadge/sqlx#4337 (same as change 1's naming rule: keep ours), #4361 (made moot by the
 pipeline: drop theirs) and #4375 (retry after a stale cached statement: keep it, around the
 pipelined write). Then run the tests and the measurements above, and update this file.
